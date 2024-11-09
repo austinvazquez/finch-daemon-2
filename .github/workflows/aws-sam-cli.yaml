@@ -1,0 +1,145 @@
+name: AWS SAM CLI CI
+on:
+  push:
+    branches: ["main"]
+    paths-ignore:
+      - '**.md'
+    tags:
+      - 'v*'
+  pull_request:
+    branches: ["main"]
+    paths:
+      - '.github/workflows/sam-cli.yml'
+      - 'contrib/integrations/aws-sam-cli/'
+  schedule:
+    # The scheduler runs at 9 am UTC every day.
+    #        ┌───────────── minute (0 - 59)
+    #        │ ┌───────────── hour (0 - 23)
+    #        │ │ ┌───────────── day of the month (1 - 31)
+    #        │ │ │ ┌───────────── month (1 - 12)
+    #        │ │ │ │ ┌───────────── day of the week (0 - 6) (Sunday to Saturday)
+    #        │ │ │ │ │
+    #        │ │ │ │ │
+    #        │ │ │ │ │
+    #        * * * * *
+    - cron: '0 9 * * *'
+  workflow_dispatch:
+
+env:
+  GO_VERSION: '1.23'
+  PYTHON_VERSION: '3.10'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout finch-daemon repo
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+
+      - uses: actions/setup-go@41dfa10bad2bb2ae585af6ee5bb4d7d973ad74ed # v5.1.0
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install runtime dependencies
+        run: ./setup-test-env.sh
+
+      - name: Build the daemon
+        run: make build
+
+      - name: Archive finch daemon
+        uses: actions/upload-artifact@b4b15b8c7c6ac21ea08fcf65892d2ee8f75cf882 # v4.4.3
+        with:
+          name: ${{ github.event_name }}-${{ github.run_id }}
+          path: 'bin/finch-daemon'
+
+  integration-tests:
+    name: Test (${{ matrix.integ_test }})
+    needs: [build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    defaults:
+      run:
+        shell: bash
+
+    strategy:
+      fail-fast: false
+      matrix:
+        integ_test:
+          - "local/start_api"
+          - "local/start_lambda"
+
+    env:
+      AWS_SAM_CLI_VERSION: ''
+      SOCKET_PATH: 'unix:///run/finch.sock'
+      API_VERSION: 'v1.41'
+      AWS_DEFAULT_REGION: 'us-east-1'
+      BY_CANARY: true
+      SAM_CLI_DEV: '1'
+
+    steps:
+      - name: Checkout finch-daemon repo
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          sparse-checkout: |
+            contrib/integrations/aws-sam-cli
+            setup-test-env.sh
+
+      - uses: actions/setup-python@0b93645e9fea7318ecaed2b359559ac225c90a2b # v5.3.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Get AWS SAM CLI version
+        run: |
+          version=$(cat contrib/integrations/aws-sam-cli/version.txt | grep aws-sam-cli)
+          version=${version/aws-sam-cli==/}
+          echo "AWS_SAM_CLI_VERSION=v${version}" >> $GITHUB_ENV
+
+      - name: Checkout AWS SAM CLI repo
+        uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4.1.7
+        with:
+          repository: aws/aws-sam-cli
+          ref: ${{ env.AWS_SAM_CLI_VERSION }}
+          fetch-tags: true
+          path: github.com/aws/aws-sam-cli
+
+      - name: Install runtime dependencies
+        run: bash setup-test-env.sh
+
+      - name: Download finch-daemon
+        uses: actions/download-artifact@fa0a91b85d4f404e444e00e005971372dc801d16 # v4.1.8
+        with:
+          name: ${{ github.event_name }}-${{ github.run_id }}
+          path: github.com/runfinch/finch-daemon
+      
+      - name: Remove default podman network config
+        run: |
+          sudo ls /etc/cni/net.d
+          sudo rm /etc/cni/net.d/87-podman-bridge.conflist
+
+      - name: Start finch-daemon
+        run: |
+          chmod +x ./finch-daemon
+          sudo ./finch-daemon --debug --socket-owner $UID &
+        working-directory: ${{ github.workspace }}/github.com/runfinch/finch-daemon
+
+      - name: Upgrade pip in environment
+        run: |
+          python -m pip install pip --upgrade
+          python -m pip install setuptools --upgrade
+
+      - name: Init samdev
+        run: make init
+        working-directory: github.com/aws/aws-sam-cli
+
+      - name: Run ${{ matrix.integ_test }} integration tests
+        run: |
+          export DOCKER_HOST=${{ env.SOCKET_PATH }}
+          export DOCKER_API_VERSION=${{ env.API_VERSION }}
+          pytest -vv -rs tests/integration/${{ matrix.integ_test }} -k 'not Terraform'
+        working-directory: github.com/aws/aws-sam-cli
